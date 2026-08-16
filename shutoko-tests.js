@@ -236,7 +236,7 @@ const html = fs.readFileSync(__dirname + '/index.html', 'utf8');
 const src = html.split('<script>').pop().split('<\/script>')[0];
 let api;
 try {
-  api = new Function('return (function(){' + src + '\nreturn {G:G,CFG:CFG,loop:loop,startCountdown:startCountdown,stepPlayer:stepPlayer,collide:collide,active:active,scene:scene,Q:Q,resetRun:resetRun,IN:IN,comboMult:comboMult,track:track,updateTraffic:updateTraffic,traffic:traffic,batchCars:batchCars,codeToSeed:codeToSeed,VEHICLES:VEHICLES,endRun:endRun,agilityBonus:agilityBonus,readInput:readInput,ROAD:ROAD,laneOffset:laneOffset,hash32:hash32,rng32:rng32,codeToSeed:codeToSeed,carLateral:carLateral,carZ:carZ,proximity:proximity,densityAt:densityAt,TOTAL_LANES:TOTAL_LANES,ROAD_HALF:ROAD_HALF,batchRange:batchRange,trafficWindow:trafficWindow,V_MIN:V_MIN,V_MAX:V_MAX,setView:setView,VIEW:VIEW,cockpit:cockpit,drawGauge:drawGauge,playerCar:playerCar,GROUND_Y:GROUND_Y,deckAbove:deckAbove,piers:piers,ground:ground,road:road,camera:camera};})()')();
+  api = new Function('return (function(){' + src + '\nreturn {G:G,CFG:CFG,loop:loop,startCountdown:startCountdown,stepPlayer:stepPlayer,collide:collide,active:active,scene:scene,Q:Q,resetRun:resetRun,IN:IN,comboMult:comboMult,track:track,updateTraffic:updateTraffic,traffic:traffic,batchCars:batchCars,codeToSeed:codeToSeed,VEHICLES:VEHICLES,endRun:endRun,agilityBonus:agilityBonus,readInput:readInput,ROAD:ROAD,laneOffset:laneOffset,hash32:hash32,rng32:rng32,codeToSeed:codeToSeed,carLateral:carLateral,carZ:carZ,proximity:proximity,densityAt:densityAt,TOTAL_LANES:TOTAL_LANES,ROAD_HALF:ROAD_HALF,batchRange:batchRange,trafficWindow:trafficWindow,V_MIN:V_MIN,V_MAX:V_MAX,setView:setView,VIEW:VIEW,cockpit:cockpit,drawGauge:drawGauge,playerCar:playerCar,GROUND_Y:GROUND_Y,deckAbove:deckAbove,piers:piers,ground:ground,road:road,camera:camera,MED:MED,medianGapOf:medianGapOf,medianBlockedUnit:medianBlockedUnit,medianBlocked:medianBlocked,medianBlockIndex:medianBlockIndex,medWall:medWall,medCap:medCap,gapsUsed:gapsUsed};})()')();
   ok('boot: init() and first loop() ran without throwing', true);
 } catch (e) {
   ok('boot: init() and first loop() ran without throwing — ' + e.message + '\n' + (e.stack || '').split('\n').slice(0, 4).join('\n'), false);
@@ -265,7 +265,10 @@ try {
   for (let i = 0; i < 4000; i++) {
     const fn = RAF.shift();
     if (!fn) break;
-    IN.raw = Math.sin(i * 0.031) * 1.1;
+    /* weave the way a player actually does: across their own three
+       lanes, not scything through the centre barrier every two seconds */
+    const target = 6.6 + Math.sin(i * 0.017) * 3.9;
+    IN.raw = Math.max(-1, Math.min(1, (target - G.lat) * 0.5));
     if (i % 137 === 0) IN.boostReq = true;
     adv(16.6);
     fn(VT);
@@ -285,7 +288,8 @@ try {
   ok('sim: wrong-side mechanic reachable', typeof G.wrong === 'boolean');
   ok('sim: peak simultaneous cars in view = ' + maxCars, maxCars > 30 && maxCars < 400);
   ok('sim: score accumulated', G.score > 0);
-  ok('sim: passes registered (' + G.passes + ')', G.passes > 90);
+  ok('sim: passes registered (' + G.passes + ', ' +
+     (G.passes / (G.dist / 1000)).toFixed(1) + ' per km)', G.passes / (G.dist / 1000) > 14);
   ok('sim: near misses are possible (' + G.nearMiss + ')', G.nearMiss > 0);
   ok('sim: flag map stayed bounded (' + api.track.size + ')', api.track.size < 4000);
 } catch (e) {
@@ -319,6 +323,46 @@ try {
   }
   ok('quality: loop survives tier changes', okQ);
 } catch (e) { ok('quality: tier change threw — ' + e.message, false); }
+
+/* ---------------- the centre barrier ---------------- */
+/* Direct regression for "it's too easy to just stay in the middle and go
+   on forever": holding the centreline must now end the run. */
+try {
+  api.setView(false);
+  api.resetRun(); api.G.phase = 'run';
+  let hits = 0, frames = 0, maxLat = 0;
+  for (let i = 0; i < 2200; i++) {
+    const fn = RAF.shift(); if (!fn) break;
+    IN.raw = Math.max(-1, Math.min(1, (0 - G.lat) * 0.8));   // hug the centreline
+    adv(16.6); fn(VT); frames++;
+    maxLat = Math.max(maxLat, Math.abs(G.lat));
+    if (G.hp < CFG.HP) { hits++; api.G.hp = CFG.HP; api.G.iframeT = 0; api.G.staggerT = 0; }
+  }
+  ok('median: hugging the centreline now gets you killed (' + hits + ' hits)', hits > 3);
+  ok('median: and it happens quickly, not eventually', hits / (frames / 60) > 0.05);
+
+  /* the opposite failure: a barrier so complete that crossing is impossible */
+  api.resetRun(); api.G.phase = 'run';
+  let cuts = 0, wrongFrames = 0;
+  for (let i = 0; i < 4000; i++) {
+    const fn = RAF.shift(); if (!fn) break;
+    IN.raw = Math.sin(i * 0.006) * 1.3;                      // slow full-width sweeps
+    adv(16.6); fn(VT);
+    if (G.wrong) wrongFrames++;
+    if (G.hp < CFG.HP) { api.G.hp = CFG.HP; api.G.iframeT = 0; api.G.staggerT = 0; }
+  }
+  cuts = api.gapsUsed.size;
+  ok('median: openings are genuinely threadable (' + cuts + ' clean crossings)', cuts > 0);
+  ok('median: the wrong side is reachable (' + wrongFrames + ' frames)', wrongFrames > 30);
+  ok('median: crossings are recorded once per opening, not per frame', cuts < 200);
+
+  ok('median: barrier sections are being rendered (' + api.medWall.count + ')',
+     api.medWall.count > 10);
+  ok('median: lit caps match the concrete section for section',
+     api.medCap.count === api.medWall.count);
+} catch (e) {
+  ok('median: check threw — ' + e.message + ' :: ' + (e.stack || '').split('\n')[1], false);
+}
 
 /* ---------------- ribbon winding ---------------- */
 /* The regression test for "the street texture is missing": every vertex
@@ -385,7 +429,8 @@ try {
   let frames = 0, nan = false;
   for (let i = 0; i < 900; i++) {
     const fn = RAF.shift(); if (!fn) break;
-    IN.raw = Math.sin(i * 0.04);
+    const tgt = 6.6 + Math.sin(i * 0.02) * 3.6;
+    IN.raw = Math.max(-1, Math.min(1, (tgt - G.lat) * 0.5));
     adv(16.6); fn(VT); frames++;
     if (!isFinite(G.dist) || !isFinite(G.lat)) { nan = true; break; }
     if (G.hp < CFG.HP) { api.G.hp = CFG.HP; api.G.iframeT = 0; }
@@ -762,6 +807,79 @@ const S = api;
     if (observe(t, 0) !== observe(t, a)) { lateJoin = false; break; }
   }
   ok('sync: late joiner sees identical traffic', lateJoin);
+}
+
+/* ---- 14b. Centre barrier ------------------------------------------ */
+/* The bug this closes: with a flush painted median, nothing ever spawns
+   between the carriageways, so sitting on the centreline was a risk-free
+   infinite run. */
+{
+  const seed = S.codeToSeed('MED1');
+
+  let pure = true;
+  for (let i = 0; i < 60000; i++) {
+    const z = (i * 37.3) % 90000;
+    if (S.medianBlocked(seed, z) !== S.medianBlocked(seed, z)) { pure = false; break; }
+  }
+  ok('median: blocking is a pure function of distance', pure);
+
+  /* what you see and what you hit must be the same function */
+  let agree = true, quantised = true;
+  for (let u = 40; u < 8000; u++) {
+    const base = S.medianBlockedUnit(seed, u);
+    for (const f of [0.05, 0.5, 0.95]) {
+      const z = (u + f) * S.MED.UNIT;
+      if (S.medianBlocked(seed, z) !== base) agree = false;
+    }
+    if (S.medianBlocked(seed, u * S.MED.UNIT) !== base) quantised = false;
+  }
+  ok('median: collision agrees with the rendered sections', agree);
+  ok('median: blocking is constant across a whole 6 m section', quantised);
+
+  /* coverage: mostly solid, but never sealed shut */
+  function coverage(z0, z1) {
+    let blocked = 0, total = 0;
+    for (let z = z0; z < z1; z += S.MED.UNIT) { total++; if (S.medianBlocked(seed, z)) blocked++; }
+    return blocked / total;
+  }
+  const early = coverage(500, 6000), late = coverage(30000, 40000);
+  ok('median: mostly solid early (' + (early * 100).toFixed(0) + '%)', early > 0.65 && early < 0.92);
+  ok('median: tightens later (' + (late * 100).toFixed(0) + '%)', late > early);
+  ok('median: never fully sealed (' + (late * 100).toFixed(0) + '%)', late < 0.97);
+
+  /* there must always be a way across within a reasonable distance */
+  let worstWait = 0, run = 0;
+  for (let z = S.MED.START; z < 200000; z += S.MED.UNIT) {
+    if (S.medianBlocked(seed, z)) { run += S.MED.UNIT; worstWait = Math.max(worstWait, run); }
+    else run = 0;
+  }
+  ok('median: an opening is never more than ' + worstWait + ' m away', worstWait < 340);
+
+  /* openings shrink with distance but stay physically threadable */
+  function gapLen(z) { return S.medianGapOf(seed, S.medianBlockIndex(z)).span * S.MED.UNIT; }
+  let minGap = 1e9, maxGap = 0;
+  for (let z = 400; z < 200000; z += 156) {
+    const g = gapLen(z); minGap = Math.min(minGap, g); maxGap = Math.max(maxGap, g);
+  }
+  ok('median: openings shrink over a run (' + maxGap + ' m -> ' + minGap + ' m)', maxGap > minGap);
+  ok('median: narrowest opening is still crossable (' + minGap + ' m)', minGap >= 12);
+  ok('median: early openings are generous (' + maxGap + ' m)', maxGap >= 24);
+
+  ok('median: open runway before the first barrier', !S.medianBlocked(seed, 100));
+  ok('median: barrier has begun by 600 m', S.medianBlocked(seed, 600) || S.medianBlocked(seed, 700));
+
+  /* geometry: the barrier must fit the median without eating lane one */
+  ok('median: barrier fits between the carriageways',
+     S.MED.HW * 2 < S.CFG.MEDIAN);
+  /* how far the player may drift in from the centre of lane one before
+     the barrier starts hurting — measured centre-to-centre, which is what
+     the collision test actually compares */
+  const drift = S.laneOffset(0) - (S.MED.HW + S.CFG.CAR_HW);
+  ok('median: room to drift inside lane one (' + drift.toFixed(2) + ' m)', drift > 0.8);
+  ok('median: but lane one is not a safe wall-hug either', drift < 2.0);
+  ok('median: different rooms put the openings elsewhere',
+     S.medianGapOf(seed, 30).off !== S.medianGapOf(S.codeToSeed('MED2'), 30).off ||
+     S.medianGapOf(seed, 31).off !== S.medianGapOf(S.codeToSeed('MED2'), 31).off);
 }
 
 /* ---- 15. Balance guards ------------------------------------------- */

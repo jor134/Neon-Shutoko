@@ -289,7 +289,8 @@ input.fld:focus{outline:none;border-color:var(--cy);box-shadow:0 0 0 1px rgba(34
 
     <div class="foot">
       Pass close for charge. Spend charge to cut the line.<br>
-      Cross the median for 1.6x score and oncoming headlights.<br>
+      Cross at the amber gaps only &mdash; the barrier is solid.<br>
+      Wrong side pays 1.6x, and arrives head-on.<br>
       Elevated deck &middot; the city runs underneath you.<br>
       Three hits and the run is over.
     </div>
@@ -622,6 +623,49 @@ function batchRange(d) {
     Math.ceil((d + CFG.VIEW_AHEAD + 60) / CFG.SPAWN_SPACING),
   ];
 }
+
+/* ------------------------------------------------------------------ */
+/* 4b. THE CENTRE BARRIER                                              */
+/* ------------------------------------------------------------------ */
+/* A flush painted median turns out to be a free ride: nothing ever
+ * spawns between the carriageways, so a player can sit on the centreline
+ * and drive forever without ever making a decision. Real Shutoko has a
+ * concrete barrier down the middle with openings only where it needs
+ * them, and that is also the right game design — crossing to the wrong
+ * side should cost planning, not just a flick of the thumb.
+ *
+ * Everything is quantised to a 6 m unit grid. That matters: it means the
+ * barrier you can SEE and the barrier you COLLIDE with are the same
+ * function, so a gap can never render 6 m wider than it really is.
+ */
+const MED = {
+  UNIT: 6,        // length of one precast barrier section, metres
+  BLOCK: 26,      // units per repeating block — one opening per 156 m
+  HW: 0.9,        // half width of the barrier itself
+  START: 260,     // open median for the first stretch, to let people settle
+};
+
+/* Where is the opening in block `blk`, and how wide? PURE. */
+function medianGapOf(seed, blk) {
+  const r = rng32(hash32(seed ^ 0x51a7c33d, blk));
+  const km = (blk * MED.BLOCK * MED.UNIT) / 1000;
+  /* openings tighten from 30 m down to 12 m over the first ~9 km */
+  const span = Math.max(2, Math.round(5 - Math.min(3, km * 0.34))) + (r() < 0.25 ? 1 : 0);
+  const off = 1 + Math.floor(r() * Math.max(1, MED.BLOCK - span - 2));
+  return { off, span };
+}
+
+function medianBlockedUnit(seed, u) {
+  if (u * MED.UNIT < MED.START) return false;
+  const blk = Math.floor(u / MED.BLOCK);
+  const g = medianGapOf(seed, blk);
+  const k = u - blk * MED.BLOCK;
+  return !(k >= g.off && k < g.off + g.span);
+}
+function medianBlocked(seed, z) {
+  return medianBlockedUnit(seed, Math.floor(z / MED.UNIT));
+}
+function medianBlockIndex(z) { return Math.floor(z / (MED.UNIT * MED.BLOCK)); }
 
 /* ------------------------------------------------------------------ */
 /* 5. GAMEPLAY MATH (pure, unit-testable)                              */
@@ -1596,7 +1640,9 @@ function makeRibbon(n, cols) {
 }
 
 let road, rail = [], median, fascia = [], reflect, piers, ground;
+let medWall, medCap, gapMark;
 const PIER_CAP = 30, PIER_STEP = 52;
+const MED_CAP = 130, MED_DRAW = 720, GAP_CAP = 14;
 
 function buildRoad() {
   road = new THREE.Mesh(makeRibbon(RIB_N, 2), trackMat(toonMat({
@@ -1661,6 +1707,39 @@ function buildRoad() {
   ground.renderOrder = -1;
   scene.add(ground);
 
+  /* --- the centre barrier: concrete, plus a lit cap so the openings
+         are readable from a long way back --- */
+  medWall = new THREE.InstancedMesh(
+    addTint(boxGeo(MED.HW * 2, 0.86, MED.UNIT - 0.35, 0, 0.43, 0), MED_CAP),
+    trackMat(toonMat({
+      color: 0x4a5372, rim: 0x9fd2ff, steps: 3, rimPow: 1.9, tint: true,
+      fogNear: 90, fogFar: Q.fogFar
+    })), MED_CAP);
+  medWall.frustumCulled = false; medWall.count = 0;
+  scene.add(medWall);
+
+  medCap = new THREE.InstancedMesh(
+    addTint(boxGeo(MED.HW * 2.1, 0.10, MED.UNIT - 0.35, 0, 0.91, 0), MED_CAP),
+    trackMat(toonMat({
+      color: 0xffb42e, emissive: 0xffb42e, emisMix: 0.9, steps: 2, tint: true,
+      fogNear: 90, fogFar: Q.fogFar
+    })), MED_CAP);
+  medCap.frustumCulled = false; medCap.count = 0;
+  medCap.renderOrder = 1;
+  scene.add(medCap);
+
+  /* amber lamps on the end of every barrier run mark where you can cross */
+  gapMark = new THREE.InstancedMesh(
+    addTint(new THREE.PlaneGeometry(2.6, 2.6), GAP_CAP),
+    trackMat(toonMat({
+      color: 0xffb42e, map: TEX.glow, emissive: 0xffb42e, emisMix: 1,
+      transparent: true, additive: true, depthWrite: false, tint: true,
+      fogNear: 900, fogFar: 1800
+    })), GAP_CAP);
+  gapMark.frustumCulled = false; gapMark.count = 0;
+  gapMark.renderOrder = 6;
+  scene.add(gapMark);
+
   const cap = 120;
   const rg = addTint(new THREE.PlaneGeometry(0.34, 0.34), cap);
   reflect = new THREE.InstancedMesh(rg, trackMat(toonMat({
@@ -1673,7 +1752,7 @@ function buildRoad() {
   scene.add(reflect);
 }
 
-function updateRoad() {
+function updateRoad(seed) {
   const RD = road.geometry.attributes;
   const RL = rail[0].geometry.attributes, RR = rail[1].geometry.attributes;
   const FL = fascia[0].geometry.attributes, FR = fascia[1].geometry.attributes;
@@ -1757,6 +1836,51 @@ function updateRoad() {
   piers.count = np;
   piers.instanceMatrix.needsUpdate = true;
   piers.geometry.attributes.aTint.needsUpdate = true;
+
+  /* --- centre barrier sections, on the same 6 m grid the collision
+         test uses, so what you see is exactly what you can hit --- */
+  let nw = 0, ng = 0;
+  const wTint = medWall.geometry.attributes.aTint.array;
+  const cTint = medCap.geometry.attributes.aTint.array;
+  const gTintA = gapMark.geometry.attributes.aTint.array;
+  const u0 = Math.floor((originZ - 40) / MED.UNIT);
+  const uN = Math.ceil((originZ + MED_DRAW) / MED.UNIT);
+  let prevBlocked = medianBlockedUnit(seed, u0 - 1);
+  for (let u = u0; u <= uN && nw < MED_CAP; u++) {
+    const blocked = medianBlockedUnit(seed, u);
+    const zw = (u + 0.5) * MED.UNIT;
+    if (blocked) {
+      _p.set(rX(zw, 0), rY(zw, 0), rZ(zw));
+      _e.set(0, -ROAD.heading(zw), 0);
+      _q.setFromEuler(_e);
+      _s.set(1, 1, 1);
+      _m.compose(_p, _q, _s);
+      medWall.setMatrixAt(nw, _m);
+      medCap.setMatrixAt(nw, _m);
+      wTint[nw * 3] = 1; wTint[nw * 3 + 1] = 1; wTint[nw * 3 + 2] = 1;
+      const pulse = 0.75 + 0.25 * Math.sin(nowT * 3.1 + u * 0.7);
+      cTint[nw * 3] = pulse; cTint[nw * 3 + 1] = pulse * 0.82; cTint[nw * 3 + 2] = pulse * 0.4;
+      nw++;
+    }
+    if (blocked !== prevBlocked && ng < GAP_CAP) {
+      const ez = u * MED.UNIT;
+      _p.set(rX(ez, 0), rY(ez, 1.5), rZ(ez));
+      _q.copy(camera.quaternion);
+      _s.set(1, 1, 1);
+      _m.compose(_p, _q, _s);
+      gapMark.setMatrixAt(ng, _m);
+      gTintA[ng * 3] = 1; gTintA[ng * 3 + 1] = 0.72; gTintA[ng * 3 + 2] = 0.2;
+      ng++;
+    }
+    prevBlocked = blocked;
+  }
+  medWall.count = nw; medCap.count = nw; gapMark.count = ng;
+  medWall.instanceMatrix.needsUpdate = true;
+  medCap.instanceMatrix.needsUpdate = true;
+  gapMark.instanceMatrix.needsUpdate = true;
+  medWall.geometry.attributes.aTint.needsUpdate = true;
+  medCap.geometry.attributes.aTint.needsUpdate = true;
+  gapMark.geometry.attributes.aTint.needsUpdate = true;
 
   /* barrier reflectors every 16 m */
   const STEP = 16;
@@ -2113,7 +2237,9 @@ const G = {
   flashT: 0,
   wrong: false,
   poolPeak: 0,
+  medSide: 1,
 };
+const gapsUsed = new Set();
 
 const COLORS = [0x22e7ff, 0xff2e88, 0xffb42e, 0x4dffa8, 0x7c5cff, 0xff5d3a, 0xffffff];
 G.colorHex = COLORS[hash32(codeToSeed(G.id), 7) % COLORS.length];
@@ -2485,6 +2611,14 @@ function updateTraffic(dt) {
 }
 
 function collide(dt) {
+  /* The centre barrier. One test, against exactly the same quantised
+     function the renderer uses to place the sections. */
+  if (G.iframeT <= 0 && Math.abs(G.lat) < MED.HW + CFG.CAR_HW &&
+      medianBlocked(G.seed, G.dist)) {
+    crash(G.dist, 0, -G.lat, 'BARRIER');
+    return;
+  }
+
   const cutoff = 40;
   for (let i = 0; i < active.length; i++) {
     const c = active[i];
@@ -2499,7 +2633,7 @@ function collide(dt) {
     const p = proximity(dLat, dLon, V.w * 0.5, V.l * 0.5);
 
     if (p === 2 && G.iframeT <= 0 && G.phase === 'run') {
-      crash(c, dLat);
+      crash(c._z, c._lat, dLat);
       return;
     }
     if (p === 1 && !(f & 4)) {
@@ -2527,6 +2661,17 @@ function onPass(c) {
   G.score += CFG.SCORE_PASS * comboMult(G.combo) * (G.wrong ? 1.6 : 1);
 }
 
+function onGapCut() {
+  G.combo = Math.min(CFG.COMBO_MAX, G.combo + 2);
+  G.comboT = CFG.COMBO_TIME;
+  G.bestCombo = Math.max(G.bestCombo, G.combo);
+  G.score += 140 * comboMult(G.combo);
+  if (G.charges < CFG.CHARGE_MAX) { G.charges++; popCharge(G.charges - 1); }
+  popRing(rX(G.dist, 0), rY(G.dist, 1.2), rZ(G.dist), 0xffb42e);
+  toast('MEDIAN CUT', '#ffb42e');
+  buzz(18);
+}
+
 function onGraze(c, dLat) {
   G.nearMiss++;
   G.combo = Math.min(CFG.COMBO_MAX, G.combo + 1);
@@ -2544,7 +2689,7 @@ function onGraze(c, dLat) {
   buzz(12);
 }
 
-function crash(c, dLat) {
+function crash(zw, lat, dLat, label) {
   G.hp--;
   G.combo = 0;
   G.charges = 0;
@@ -2556,8 +2701,8 @@ function crash(c, dLat) {
   G.shakeT = 0.75;
   G.hurtT = 0.8;
   G.flashT = 0.12;
-  burstSparks(rX(c._z, c._lat), 0.9, rZ(c._z), 26, 13, [1, 0.62, 0.25]);
-  toast(G.hp > 0 ? 'HIT' : 'WRECKED', '#ff2e88');
+  burstSparks(rX(zw, lat), 0.9, rZ(zw), 26, 13, [1, 0.62, 0.25]);
+  toast(G.hp > 0 ? (label || 'HIT') : 'WRECKED', '#ff2e88');
   buzz([40, 40, 60]);
   renderCharges();
   if (G.hp <= 0) endRun();
@@ -2617,6 +2762,20 @@ function stepPlayer(dt) {
       G.shakeT = Math.max(G.shakeT, 0.08);
     }
     G.latV *= -0.15;
+  }
+
+  /* Crossing the centreline through an opening is the riskiest thing in
+     the game, so it pays. Once per opening, so it cannot be farmed by
+     weaving back and forth through the same one. */
+  const side = G.lat >= 0 ? 1 : -1;
+  if (side !== G.medSide) {
+    G.medSide = side;
+    const blk = medianBlockIndex(G.dist);
+    if (G.dist > MED.START && !gapsUsed.has(blk) &&
+        !medianBlocked(G.seed, G.dist)) {
+      gapsUsed.add(blk);
+      onGapCut();
+    }
   }
 
   G.wrong = G.lat < -CFG.MEDIAN * 0.5;
@@ -2805,6 +2964,8 @@ function resetRun() {
   G.shakeT = 0; G.hurtT = 0; G.flashT = 0;
   track.clear();
   batchCache.clear();
+  gapsUsed.clear();
+  G.medSide = 1;
   paused = false;
   el('pause').textContent = 'PAUSE';
   renderCharges();
@@ -3123,7 +3284,7 @@ function loop() {
   originX = ROAD.x(G.dist);
   originY = ROAD.y(G.dist);
 
-  updateRoad();
+  updateRoad(G.seed);
   updateCity(G.seed);
   updateTraffic(dt);
   if (running) collide(dt);
