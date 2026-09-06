@@ -236,7 +236,7 @@ const html = fs.readFileSync(__dirname + '/index.html', 'utf8');
 const src = html.split('<script>').pop().split('<\/script>')[0];
 let api;
 try {
-  api = new Function('return (function(){' + src + '\nreturn {G:G,CFG:CFG,loop:loop,startCountdown:startCountdown,stepPlayer:stepPlayer,collide:collide,active:active,scene:scene,Q:Q,resetRun:resetRun,IN:IN,comboMult:comboMult,track:track,updateTraffic:updateTraffic,traffic:traffic,batchCars:batchCars,codeToSeed:codeToSeed,VEHICLES:VEHICLES,endRun:endRun,agilityBonus:agilityBonus,readInput:readInput,ROAD:ROAD,laneOffset:laneOffset,hash32:hash32,rng32:rng32,codeToSeed:codeToSeed,carLateral:carLateral,carZ:carZ,proximity:proximity,densityAt:densityAt,TOTAL_LANES:TOTAL_LANES,ROAD_HALF:ROAD_HALF,batchRange:batchRange,trafficWindow:trafficWindow,V_MIN:V_MIN,V_MAX:V_MAX,setView:setView,VIEW:VIEW,cockpit:cockpit,drawGauge:drawGauge,playerCar:playerCar,GROUND_Y:GROUND_Y,deckAbove:deckAbove,piers:piers,ground:ground,road:road,camera:camera,MED:MED,medianGapOf:medianGapOf,medianBlockedUnit:medianBlockedUnit,medianBlocked:medianBlocked,medianBlockIndex:medianBlockIndex,medWall:medWall,medCap:medCap,gapsUsed:gapsUsed};})()')();
+  api = new Function('return (function(){' + src + '\nreturn {G:G,CFG:CFG,loop:loop,startCountdown:startCountdown,stepPlayer:stepPlayer,collide:collide,active:active,scene:scene,Q:Q,resetRun:resetRun,IN:IN,comboMult:comboMult,track:track,updateTraffic:updateTraffic,traffic:traffic,batchCars:batchCars,codeToSeed:codeToSeed,VEHICLES:VEHICLES,endRun:endRun,agilityBonus:agilityBonus,readInput:readInput,ROAD:ROAD,laneOffset:laneOffset,hash32:hash32,rng32:rng32,codeToSeed:codeToSeed,carLateral:carLateral,carZ:carZ,proximity:proximity,densityAt:densityAt,TOTAL_LANES:TOTAL_LANES,ROAD_HALF:ROAD_HALF,batchRange:batchRange,trafficWindow:trafficWindow,V_MIN:V_MIN,V_MAX:V_MAX,setView:setView,VIEW:VIEW,cockpit:cockpit,drawGauge:drawGauge,playerCar:playerCar,GROUND_Y:GROUND_Y,deckAbove:deckAbove,piers:piers,ground:ground,road:road,camera:camera,MED:MED,medianGapOf:medianGapOf,medianBlockedUnit:medianBlockedUnit,medianBlocked:medianBlocked,medianBlockIndex:medianBlockIndex,medWall:medWall,medCap:medCap,gapsUsed:gapsUsed,POLICE:POLICE,PUR:PUR,heatRate:heatRate,cruiserSpeed:cruiserSpeed,waveCars:waveCars,heliActive:heliActive,startPursuit:startPursuit,endPursuit:endPursuit,resetPolice:resetPolice,cruisers:cruisers,heli:heli,spot:spot};})()')();
   ok('boot: init() and first loop() ran without throwing', true);
 } catch (e) {
   ok('boot: init() and first loop() ran without throwing — ' + e.message + '\n' + (e.stack || '').split('\n').slice(0, 4).join('\n'), false);
@@ -323,6 +323,139 @@ try {
   }
   ok('quality: loop survives tier changes', okQ);
 } catch (e) { ok('quality: tier change threw — ' + e.message, false); }
+
+/* ---------------- police pursuit ---------------- */
+try {
+  /* Clean driving must never summon anyone. If holding your own lane can
+     get you chased, the heat model is punishing the wrong behaviour. */
+  api.setView(false);
+  api.resetRun(); api.G.phase = 'run';
+  for (let i = 0; i < 3200; i++) {
+    const fn = RAF.shift(); if (!fn) break;
+    IN.raw = Math.max(-1, Math.min(1, (6.6 - G.lat) * 0.5));
+    IN.boostReq = false;
+    adv(16.6); fn(VT);
+    if (G.hp < CFG.HP) { api.G.hp = CFG.HP; api.G.iframeT = 0; api.G.staggerT = 0; }
+  }
+  ok('police: clean lane driving never draws heat (' + api.PUR.heat.toFixed(0) + ')',
+     api.PUR.state === 'clear' && api.PUR.wave === 0);
+
+  /* Running the wrong carriageway must get you hunted, and reasonably fast. */
+  api.resetRun(); api.G.phase = 'run';
+  let trigFrame = -1;
+  for (let i = 0; i < 2600; i++) {
+    const fn = RAF.shift(); if (!fn) break;
+    IN.raw = Math.max(-1, Math.min(1, (-6.6 - G.lat) * 0.7));
+    adv(16.6); fn(VT);
+    if (G.hp < CFG.HP) { api.G.hp = CFG.HP; api.G.iframeT = 0; api.G.staggerT = 0; }
+    if (trigFrame < 0 && api.PUR.state === 'chase') trigFrame = i;
+  }
+  ok('police: wrong-side running gets you hunted (frame ' + trigFrame + ')', trigFrame > 0);
+  ok('police: and not instantly — there is time to reconsider',
+     trigFrame > 120);
+
+  /* Cruisers must actually arrive, close, and be capable of hitting you. */
+  api.resetRun(); api.G.phase = 'run';
+  api.PUR.wave = api.POLICE.HELI_WAVE - 1; api.startPursuit();
+  let live = 0, closest = 1e9, hits = 0, ended = -1;
+  for (let i = 0; i < 3400; i++) {
+    const fn = RAF.shift(); if (!fn) break;
+    IN.raw = Math.max(-1, Math.min(1, (6.6 - G.lat) * 0.5));
+    adv(16.6); fn(VT);
+    live = Math.max(live, api.PUR.cars.filter(c => c.live).length);
+    api.PUR.cars.forEach(c => { if (c.live) closest = Math.min(closest, Math.abs(G.dist - c.z)); });
+    if (G.hp < CFG.HP) { hits++; api.G.hp = CFG.HP; api.G.iframeT = 0; api.G.staggerT = 0; }
+    if (ended < 0 && api.PUR.state === 'clear') ended = i;
+  }
+  ok('police: a wave puts cruisers on the road (' + live + ')', live >= 1);
+  ok('police: they close to ramming range (' + closest.toFixed(0) + ' m)', closest < 25);
+  ok('police: contact costs you health (' + hits + ' hits)', hits > 0);
+  ok('police: pursuits do end (frame ' + ended + ')', ended > 0);
+  ok('police: and end within the stated timer',
+     ended > 0 && ended * (1 / 60) < api.POLICE.PURSUIT_MAX + 6);
+
+  /* Air support at wave 3, per the escalation rules. */
+  api.resetRun(); api.G.phase = 'run';
+  api.PUR.wave = 0; api.startPursuit();
+  ok('police: no helicopter on the first wave', api.PUR.heliUp === false);
+  api.PUR.wave = api.POLICE.HELI_WAVE - 1; api.startPursuit();
+  ok('police: helicopter joins at wave ' + api.POLICE.HELI_WAVE, api.PUR.heliUp === true);
+  for (let i = 0; i < 90; i++) { const fn = RAF.shift(); if (fn) { adv(16.6); fn(VT); } }
+  ok('police: helicopter and spotlight are drawn', api.heli.visible && api.spot.visible);
+  api.endPursuit('timer');
+  ok('police: shaking them leaves residual heat, not a clean slate',
+     api.PUR.heat === api.POLICE.HEAT_AFTER);
+  ok('police: everything is stood down after a pursuit',
+     !api.heli.visible && !api.spot.visible &&
+     api.cruisers.every(g => g.visible === false));
+
+  /* The load-bearing multiplayer guarantee: police are local and must not
+     perturb anything the other clients derive. */
+  const seed = api.codeToSeed('COP1');
+  const before = JSON.stringify(api.batchCars(seed, 700));
+  api.resetRun(); api.G.phase = 'run'; api.PUR.wave = 2; api.startPursuit();
+  for (let i = 0; i < 400; i++) { const fn = RAF.shift(); if (fn) { adv(16.6); fn(VT); } }
+  ok('police: traffic derivation is untouched by a pursuit',
+     JSON.stringify(api.batchCars(seed, 700)) === before);
+  api.resetPolice();
+} catch (e) {
+  ok('police: check threw — ' + e.message + ' :: ' + (e.stack || '').split('\n')[1], false);
+}
+
+/* ---------------- pursuit balance ---------------- */
+/* These pin down the shape the tuning arrived at, because every one of
+   them was wrong at some point during it: early waves must be
+   outrunnable, air support must actually deny that, and the light must
+   be breakable by a decisive lane change rather than being a wall. */
+try {
+  function chase(runs, wave, style) {
+    let gap = 0, timer = 0, spot = 0, fr = 0;
+    for (let run = 0; run < runs; run++) {
+      api.resetRun(); api.G.phase = 'run';
+      api.PUR.wave = wave; api.startPursuit();
+      let f = 0;
+      for (let i = 0; i < 3600; i++) {
+        const fn = RAF.shift(); if (!fn) break;
+        const tgt = style === 'hold' ? api.laneOffset(1)
+                                     : api.laneOffset(f % 190 < 95 ? 0 : 2);
+        IN.raw = Math.max(-1, Math.min(1, (tgt - G.lat) * 0.8));
+        if (G.charges > 0) IN.boostReq = true;
+        adv(16.6); fn(VT); f++; fr++;
+        if (api.PUR.spotted) spot++;
+        if (G.hp < CFG.HP) api.G.hp = CFG.HP;      // isolate the pursuit from traffic
+        if (api.PUR.state === 'clear') {
+          if (f / 60 < api.POLICE.PURSUIT_MAX - 2) gap++; else timer++;
+          break;
+        }
+      }
+    }
+    return { gap, timer, spot: 100 * spot / fr };
+  }
+
+  const w1 = chase(6, 0, 'hold');
+  ok('balance: the first wave can be outrun (' + w1.gap + '/6 by gap)', w1.gap >= 4);
+  ok('balance: no helicopter that early (' + w1.spot.toFixed(0) + '% spotted)', w1.spot < 5);
+
+  const w2 = chase(6, 1, 'hold');
+  ok('balance: the second wave is still outrunnable (' + w2.gap + '/6)', w2.gap >= 3);
+
+  const w3h = chase(6, api.POLICE.HELI_WAVE - 1, 'hold');
+  ok('balance: air support locks on to a held lane (' + w3h.spot.toFixed(0) + '% spotted)',
+     w3h.spot > 80);
+  ok('balance: and denies the gap escape (' + w3h.timer + '/6 ran the clock)', w3h.timer >= 5);
+
+  const w3s = chase(6, api.POLICE.HELI_WAVE - 1, 'swerve');
+  ok('balance: decisive lane changes break the light (' + w3s.spot.toFixed(0) +
+     '% vs ' + w3h.spot.toFixed(0) + '% spotted)', w3s.spot < w3h.spot - 15);
+  ok('balance: but breaking it never fully stops the light re-acquiring', w3s.spot > 25);
+
+  const w5 = chase(6, api.POLICE.MAX_WAVE - 1, 'hold');
+  ok('balance: every pursuit resolves one way or the other',
+     w5.gap + w5.timer === 6);
+  api.resetPolice();
+} catch (e) {
+  ok('balance: check threw — ' + e.message + ' :: ' + (e.stack || '').split('\n')[1], false);
+}
 
 /* ---------------- the centre barrier ---------------- */
 /* Direct regression for "it's too easy to just stay in the middle and go
@@ -880,6 +1013,54 @@ const S = api;
   ok('median: different rooms put the openings elsewhere',
      S.medianGapOf(seed, 30).off !== S.medianGapOf(S.codeToSeed('MED2'), 30).off ||
      S.medianGapOf(seed, 31).off !== S.medianGapOf(S.codeToSeed('MED2'), 31).off);
+}
+
+/* ---- 14c. Police model (pure) -------------------------------------- */
+{
+  const P = S.POLICE;
+  ok('heat: doing nothing reckless cools you off', S.heatRate(false, false, 0) < 0);
+  ok('heat: wrong side heats you up', S.heatRate(true, false, 0) > 0);
+  ok('heat: boosting heats you up', S.heatRate(false, true, 0) > 0);
+  ok('heat: both together is worse than either',
+     S.heatRate(true, true, 0) > Math.max(S.heatRate(true, false, 0), S.heatRate(false, true, 0)));
+  ok('heat: any active source suspends the decay entirely',
+     S.heatRate(true, false, 40) > 0);
+  ok('heat: cooling slows down as a run gets long',
+     Math.abs(S.heatRate(false, false, 20)) < Math.abs(S.heatRate(false, false, 0)));
+  ok('heat: cooling never stops completely', S.heatRate(false, false, 500) < -0.5);
+  const tWrong = P.HEAT_MAX / S.heatRate(true, false, 0);
+  ok('heat: wrong-siding gets you wanted in ' + tWrong.toFixed(1) + ' s',
+     tWrong > 4 && tWrong < 12);
+  const tCool = P.HEAT_MAX / Math.abs(S.heatRate(false, false, 0));
+  ok('heat: and behaving clears it in ' + tCool.toFixed(1) + ' s', tCool > 6 && tCool < 25);
+
+  ok('waves: first wave is a single car', S.waveCars(1) === 1 || S.waveCars(1) === 2);
+  let mono = true;
+  for (let w = 2; w <= P.MAX_WAVE; w++) if (S.waveCars(w) < S.waveCars(w - 1)) mono = false;
+  ok('waves: never send fewer cars than the wave before', mono);
+  ok('waves: stay inside the cruiser pool', S.waveCars(99) <= P.CRUISER_CAP);
+  ok('waves: no helicopter early', !S.heliActive(1) && !S.heliActive(P.HELI_WAVE - 1));
+  ok('waves: helicopter from wave ' + P.HELI_WAVE, S.heliActive(P.HELI_WAVE));
+
+  /* The rubber band has to allow a gap to open, or "outrun them" is a lie */
+  const far = S.cruiserSpeed(70, 1, P.ESCAPE_GAP, false);
+  const near = S.cruiserSpeed(70, 1, 70, false);       // inside the catch-up band
+  ok('chase: the ease point is inside the escape gap, so a gap can grow into one',
+     P.ESCAPE_GAP * P.EASE_AT < P.ESCAPE_GAP - 40);
+  ok('chase: they ease off once the gap is open (' + far.toFixed(0) + ' vs ' + near.toFixed(0) + ')',
+     far < near);
+  ok('chase: an open gap means they fall behind, not merely close slower', far < 70);
+  ok('chase: they close hard from mid range', near > 70);
+  ok('chase: they back off your bumper rather than gluing to it',
+     S.cruiserSpeed(70, 1, 8, false) < near);
+  ok('chase: the spotlight cancels the ease-off, so air support must be broken',
+     S.cruiserSpeed(70, 1, P.ESCAPE_GAP, true) >= 70);
+  ok('chase: later waves are faster', S.cruiserSpeed(70, 4, 70, false) > S.cruiserSpeed(70, 1, 70, false));
+  ok('chase: once clear they sit under your speed, not merely closing slower',
+     S.cruiserSpeed(90, 5, P.ESCAPE_GAP, false) < 90);
+  ok('chase: never faster than physics allows', S.cruiserSpeed(500, 5, 100, true) <= S.CFG.SPD_MAX * 1.55);
+  ok('chase: never stationary', S.cruiserSpeed(0, 1, 400, false) >= 22);
+  ok('chase: escape gap is inside the draw distance', P.ESCAPE_GAP < S.CFG.VIEW_AHEAD);
 }
 
 /* ---- 15. Balance guards ------------------------------------------- */

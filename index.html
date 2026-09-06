@@ -167,6 +167,24 @@ input.fld:focus{outline:none;border-color:var(--cy);box-shadow:0 0 0 1px rgba(34
 #wrong b{font-family:'Zen Kaku Gothic New',sans-serif;font-size:15px;color:var(--mag)}
 #wrong span{font-size:10px;letter-spacing:.26em;color:#fff}
 
+/* heat + wanted */
+#heat{position:absolute;left:50%;top:calc(46px + var(--safe-t));transform:translateX(-50%);
+  width:132px;height:4px;background:rgba(255,255,255,.13);opacity:0;transition:opacity .25s}
+#heatFill{height:100%;width:0%;background:linear-gradient(90deg,var(--amb),var(--mag));
+  box-shadow:0 0 10px var(--mag);transition:width .12s linear}
+#heat.hot{box-shadow:0 0 14px rgba(255,37,64,.7)}
+#wanted{position:absolute;left:50%;top:calc(58px + var(--safe-t));transform:translateX(-50%);
+  display:none;flex-direction:column;align-items:center;gap:4px;padding:6px 16px;
+  background:rgba(255,37,64,.2);border:1px solid #ff2540;white-space:nowrap;
+  animation:pulseW 1s ease-in-out infinite}
+@keyframes pulseW{0%,100%{box-shadow:0 0 0 rgba(255,37,64,0)}
+  50%{box-shadow:0 0 22px rgba(255,37,64,.6)}}
+#wanted .wr{display:flex;align-items:center;gap:9px}
+#wanted b{font-family:'Zen Kaku Gothic New',sans-serif;font-size:15px;color:#ff5d70}
+#wantedTxt{font-size:11px;letter-spacing:.24em;color:#fff;font-weight:700}
+#escTrack{width:118px;height:3px;background:rgba(0,0,0,.5)}
+#escFill{height:100%;width:0%;background:var(--ok);box-shadow:0 0 8px currentColor}
+
 /* toasts */
 #toast{position:absolute;left:50%;top:38%;transform:translate(-50%,-50%);text-align:center;
   pointer-events:none}
@@ -228,6 +246,11 @@ input.fld:focus{outline:none;border-color:var(--cy);box-shadow:0 0 0 1px rgba(34
       <div id="agi">GRIP +0%</div>
     </div>
     <div id="wrong"><b class="kana">逆走</b><span>WRONG SIDE &middot; SCORE x1.6</span></div>
+    <div id="heat"><div id="heatFill"></div></div>
+    <div id="wanted">
+      <span class="wr"><b class="kana">追跡</b><span id="wantedTxt">WANTED</span></span>
+      <span id="escTrack"><span id="escFill"></span></span>
+    </div>
     <div id="rivals"></div>
     <div id="charge"></div>
     <button id="boostBtn" class="pe"><span class="k">切</span>LINECUT</button>
@@ -290,6 +313,7 @@ input.fld:focus{outline:none;border-color:var(--cy);box-shadow:0 0 0 1px rgba(34
     <div class="foot">
       Pass close for charge. Spend charge to cut the line.<br>
       Cross at the amber gaps only &mdash; the barrier is solid.<br>
+      Run wild and they come for you. Open 240 m, or survive 42 s.<br>
       Wrong side pays 1.6x, and arrives head-on.<br>
       Elevated deck &middot; the city runs underneath you.<br>
       Three hits and the run is over.
@@ -666,6 +690,82 @@ function medianBlocked(seed, z) {
   return medianBlockedUnit(seed, Math.floor(z / MED.UNIT));
 }
 function medianBlockIndex(z) { return Math.floor(z / (MED.UNIT * MED.BLOCK)); }
+
+/* ------------------------------------------------------------------ */
+/* 4c. POLICE                                                          */
+/* ------------------------------------------------------------------ */
+/* Pursuits are the one system here that is NOT deterministic, because
+ * the cars react to the player. That makes them per-player and strictly
+ * local: your cruisers are yours, and rivals see only a WANTED flag on
+ * the tape. Sharing pursuit AI across a 250 ms relay would look like
+ * cruisers teleporting, which is worse than not having them.
+ *
+ * Heat comes only from things the player CHOOSES — running the wrong
+ * carriageway, burning charge, threading openings, shaving bumpers. Raw
+ * speed is not a choice, it is the ramp, so it earns nothing. Drive your
+ * own lane cleanly and you will never see a light bar.
+ */
+const POLICE = {
+  HEAT_MAX: 100,
+  HEAT_WRONG: 14,       // per second on the wrong carriageway
+  HEAT_BOOST: 10,       // per second while a LINECUT is burning
+  HEAT_GRAZE: 3.5,      // per near miss
+  HEAT_CUT: 12,         // per median crossing
+  HEAT_DECAY: 9,        // per second when behaving
+  HEAT_AFTER: 30,       // heat still on you after shaking them
+
+  MAX_WAVE: 5,
+  CRUISER_CAP: 4,
+  HELI_WAVE: 3,
+
+  PURSUIT_MAX: 42,      // seconds before the pursuit is called off
+  ESCAPE_GAP: 185,      // metres of daylight needed...
+  ESCAPE_HOLD: 1.8,     // ...held for this long
+  EASE_AT: 0.45,        // fraction of ESCAPE_GAP at which they stop closing
+  EASE_MUL: 0.88,       // ...and how far under your speed they then sit
+  RAM_COOL: 2.6,
+  LUNGE_TIME: 1.1,      // how long a lunge at your lane lasts
+  LUNGE_GAP: 3.8,       // ...and the shadowing gap between attempts
+  SPOT_LAT: 3.0,        // lateral tolerance — under one lane width, so a
+                        // single decisive lane change slips the light
+  SPOT_LAG: 1.0,
+  LUNGE_LOCK: 1.5,      // quiet time enforced between any two lunges
+};
+
+function waveCars(w) {
+  return Math.max(1, Math.min(POLICE.CRUISER_CAP, Math.floor((w + 1) / 2) + 1));
+}
+function heliActive(w) { return w >= POLICE.HELI_WAVE; }
+
+/* Heat only decays when nothing is actively generating it, and the decay
+   weakens as the run goes on so late runs stay tense. PURE. */
+function heatRate(wrong, boosting, km) {
+  let gain = 0;
+  if (wrong) gain += POLICE.HEAT_WRONG;
+  if (boosting) gain += POLICE.HEAT_BOOST;
+  if (gain > 0) return gain;
+  return -POLICE.HEAT_DECAY * Math.max(0.25, 1 - km * 0.06);
+}
+
+/* Rubber band: cruisers close from far off and ease off your bumper, so
+   a pursuit is a chase rather than a magnet. gap > 0 means behind. PURE. */
+function cruiserSpeed(playerSpd, wave, gap, spotted) {
+  let v = playerSpd * (1.0 + 0.05 * wave);
+  if (gap > 60) v += 10;
+  else if (gap < 14) v -= 7;
+  if (spotted) v += 6;
+  /* Once you are properly clear they have lost the visual, and from then
+     on they sit UNDER your speed rather than merely closing more slowly.
+     Expressed as a fraction of your speed on purpose: a flat subtraction
+     gets swallowed by the per-wave multiplier, which is how wave two
+     ended up closing every gap and leaving the timer as the only exit.
+     Under the spotlight this inverts, so air support is the one thing
+     that can deny an escape outright. */
+  if (gap > POLICE.ESCAPE_GAP * POLICE.EASE_AT) {
+    v = spotted ? Math.max(v, playerSpd * 1.02) : Math.min(v, playerSpd * POLICE.EASE_MUL);
+  }
+  return Math.max(22, Math.min(CFG.SPD_MAX * 1.55, v));
+}
 
 /* ------------------------------------------------------------------ */
 /* 5. GAMEPLAY MATH (pure, unit-testable)                              */
@@ -1478,6 +1578,120 @@ function buildPlayerCar(bodyCol, accentCol) {
 }
 
 /* ==================================================================== */
+/* 10c. POLICE HARDWARE                                                  */
+/* ==================================================================== */
+function buildCruiser() {
+  const grp = new THREE.Group();
+  const V = VEHICLES[1];                       // the sedan shell, in livery
+  grp.add(new THREE.Mesh(carBodyGeo(V), trackMat(toonMat({
+    color: 0xe9edf5, rim: 0x8fd0ff, steps: 3, rimPow: 2.0, fogFar: Q.fogFar
+  }))));
+  /* black doors, so it reads as a patrol car in silhouette */
+  grp.add(new THREE.Mesh(mergeGeos([
+    boxGeo(V.w * 1.02, 0.42, V.l * 0.46, 0, 0.46, 0),
+    boxGeo(V.w * 1.02, 0.30, V.l * 0.20, 0, 0.92, V.l * 0.10),
+  ]), trackMat(toonMat({ color: 0x10131c, rim: 0x6f8fd0, steps: 2, fogFar: Q.fogFar }))));
+  /* light bar */
+  grp.add(new THREE.Mesh(boxGeo(1.22, 0.13, 0.24, 0, 1.36, -0.10),
+    trackMat(toonMat({ color: 0x1b2030, rim: 0x9fb8e8, steps: 2, fogFar: Q.fogFar }))));
+
+  grp.userData.beacons = [];
+  [[-0.34, 0xff2540], [0.34, 0x2f6bff]].forEach(([x, col]) => {
+    const b = new THREE.Mesh(new THREE.PlaneGeometry(2.6, 2.6),
+      trackMat(toonMat({
+        color: col, map: TEX.glow, emissive: col, emisMix: 1, transparent: true,
+        additive: true, depthWrite: false, fogNear: 2500, fogFar: 3000
+      })));
+    b.position.set(x, 1.40, -0.10);
+    b.renderOrder = 7;
+    grp.add(b);
+    grp.userData.beacons.push(b);
+  });
+  /* the wash the bar throws onto the road around the car */
+  const wash = new THREE.Mesh(new THREE.PlaneGeometry(9, 9),
+    trackMat(toonMat({
+      color: 0x4060ff, map: TEX.glow, emissive: 0x4060ff, emisMix: 1,
+      transparent: true, additive: true, depthWrite: false, fogNear: 2500, fogFar: 3000
+    })));
+  wash.rotation.x = -Math.PI / 2;
+  wash.position.y = 0.08;
+  wash.renderOrder = 4;
+  grp.add(wash);
+  grp.userData.wash = wash;
+
+  grp.visible = false;
+  return grp;
+}
+
+function buildHeli() {
+  const grp = new THREE.Group();
+  grp.add(new THREE.Mesh(mergeGeos([
+    boxGeo(1.9, 1.7, 4.6, 0, 0, 0),
+    boxGeo(0.5, 0.7, 4.2, 0, 0.2, 3.9),          // tail boom
+    boxGeo(0.22, 1.5, 0.7, 0, 0.9, 5.7),         // fin
+    boxGeo(2.9, 0.16, 0.16, 0, -0.95, 0),        // skids
+  ]), trackMat(toonMat({
+    color: 0x141a2a, rim: 0x7fb6ff, steps: 2, rimPow: 1.8, fogNear: 700, fogFar: 1600
+  }))));
+
+  const rotor = new THREE.Mesh(new THREE.CylinderGeometry(5.4, 5.4, 0.05, 12),
+    trackMat(toonMat({
+      color: 0x2a3450, rim: 0x8fc4ff, steps: 2, transparent: true, opacity: 0.30,
+      depthWrite: false, fogNear: 700, fogFar: 1600
+    })));
+  rotor.position.y = 1.25;
+  grp.add(rotor);
+  grp.userData.rotor = rotor;
+
+  grp.userData.navs = [];
+  [[-1.6, 0xff2540], [1.6, 0x30ff70]].forEach(([x, col]) => {
+    const n = new THREE.Mesh(new THREE.PlaneGeometry(1.5, 1.5),
+      trackMat(toonMat({
+        color: col, map: TEX.glow, emissive: col, emisMix: 1, transparent: true,
+        additive: true, depthWrite: false, fogNear: 2500, fogFar: 3000
+      })));
+    n.position.set(x, -0.4, 0);
+    n.renderOrder = 7;
+    grp.add(n);
+    grp.userData.navs.push(n);
+  });
+
+  grp.visible = false;
+  return grp;
+}
+
+/* The light on the road is the part that matters at speed; the shaft is
+   a single cylindrically-billboarded quad rather than a cone, for the
+   same reason the headlights stopped being a cone. */
+function buildSpot() {
+  const g = new THREE.Group();
+  const pool = new THREE.Mesh(new THREE.PlaneGeometry(19, 19),
+    trackMat(toonMat({
+      color: 0xdfeaff, map: TEX.glow, emissive: 0xdfeaff, emisMix: 1,
+      transparent: true, opacity: 0.72, additive: true, depthWrite: false,
+      fogNear: 2500, fogFar: 3000
+    })));
+  pool.rotation.x = -Math.PI / 2;
+  pool.position.y = 0.09;
+  pool.renderOrder = 5;
+  g.add(pool);
+
+  const beam = new THREE.Mesh(new THREE.PlaneGeometry(7.5, 1),
+    trackMat(toonMat({
+      color: 0xcfe0ff, map: TEX.streak, emissive: 0xcfe0ff, emisMix: 1,
+      transparent: true, opacity: 0.16, additive: true, depthWrite: false,
+      side: THREE.DoubleSide, fogNear: 2500, fogFar: 3000
+    })));
+  beam.renderOrder = 5;
+  g.add(beam);
+
+  g.userData.pool = pool;
+  g.userData.beam = beam;
+  g.visible = false;
+  return g;
+}
+
+/* ==================================================================== */
 /* 10b. COCKPIT                                                          */
 /* ==================================================================== */
 /* Parented to the camera, so it inherits shake and roll for free. It is
@@ -1491,7 +1705,7 @@ function texGauge() {
   return { canvas: c, tex: t };
 }
 
-function drawGauge(gz, kmh, rpm, hp, charges) {
+function drawGauge(gz, kmh, rpm, hp, charges, wanted) {
   const g = gz.canvas.getContext('2d');
   g.clearRect(0, 0, 256, 128);
   g.fillStyle = '#04060e'; g.fillRect(0, 0, 256, 128);
@@ -1521,6 +1735,13 @@ function drawGauge(gz, kmh, rpm, hp, charges) {
   for (let i = 0; i < 3; i++) {
     g.fillStyle = i < charges ? '#22e7ff' : '#1a2238';
     g.fillRect(188 + i * 17, 86, 13, 24);
+  }
+  if (wanted) {
+    g.fillStyle = 'rgba(255,37,64,0.9)';
+    g.fillRect(8, 106, 172, 14);
+    g.font = '700 11px "Chakra Petch", sans-serif';
+    g.textAlign = 'left'; g.fillStyle = '#fff';
+    g.fillText('WANTED ' + '\u2605'.repeat(wanted), 13, 117);
   }
   gz.tex.needsUpdate = true;
 }
@@ -2372,6 +2593,7 @@ async function netPush(extra) {
     x: Math.round(G.lat * 100) / 100,
     v: Math.round(G.spd),
     hp: G.hp, sc: Math.round(G.score), cb: G.combo,
+    wt: PUR.state === 'chase' ? PUR.wave : 0,
     alive: G.phase === 'run' ? 1 : 0
   }, extra || {});
   try {
@@ -2667,6 +2889,7 @@ function onGapCut() {
   G.bestCombo = Math.max(G.bestCombo, G.combo);
   G.score += 140 * comboMult(G.combo);
   if (G.charges < CFG.CHARGE_MAX) { G.charges++; popCharge(G.charges - 1); }
+  PUR.heat = Math.min(POLICE.HEAT_MAX, PUR.heat + POLICE.HEAT_CUT);
   popRing(rX(G.dist, 0), rY(G.dist, 1.2), rZ(G.dist), 0xffb42e);
   toast('MEDIAN CUT', '#ffb42e');
   buzz(18);
@@ -2683,6 +2906,7 @@ function onGraze(c, dLat) {
     G.charges++;
     popCharge(G.charges - 1);
   }
+  PUR.heat = Math.min(POLICE.HEAT_MAX, PUR.heat + POLICE.HEAT_GRAZE);
   G.shakeT = Math.max(G.shakeT, 0.16);
   popRing(rX(c._z, c._lat), rY(c._z, 0.9), rZ(c._z), c.oncoming ? 0xffb42e : 0x22e7ff);
   toast(c.oncoming ? 'HEAD-ON GRAZE' : 'NEAR MISS', c.oncoming ? '#ffb42e' : '#22e7ff');
@@ -2706,6 +2930,231 @@ function crash(zw, lat, dLat, label) {
   buzz([40, 40, 60]);
   renderCharges();
   if (G.hp <= 0) endRun();
+}
+
+/* ==================================================================== */
+/* 17b. PURSUIT                                                          */
+/* ==================================================================== */
+const PUR = {
+  heat: 0, wave: 0, state: 'clear',      // clear | chase
+  t: 0, escT: 0, spotted: false, heliUp: false, lungeLock: 0,
+  spotZ: 0, spotLat: 0,
+  cars: [],
+};
+let cruisers = [], heli = null, spot = null;
+
+function buildPolice() {
+  for (let i = 0; i < POLICE.CRUISER_CAP; i++) {
+    const g = buildCruiser();
+    scene.add(g);
+    cruisers.push(g);
+    PUR.cars.push({ live: false, z: 0, lat: 0, spd: 0, latV: 0, cool: 0,
+                    side: i % 2 ? 1 : -1, lungeT: 0 });
+  }
+  heli = buildHeli(); scene.add(heli);
+  spot = buildSpot(); scene.add(spot);
+}
+
+function resetPolice() {
+  PUR.heat = 0; PUR.wave = 0; PUR.state = 'clear';
+  PUR.t = 0; PUR.escT = 0; PUR.spotted = false; PUR.heliUp = false;
+  PUR.cars.forEach(c => { c.live = false; });
+  cruisers.forEach(g => { g.visible = false; });
+  if (heli) heli.visible = false;
+  if (spot) spot.visible = false;
+}
+
+function startPursuit() {
+  PUR.state = 'chase';
+  PUR.wave = Math.min(POLICE.MAX_WAVE, PUR.wave + 1);
+  PUR.t = 0; PUR.escT = 0; PUR.lungeLock = 0;
+  PUR.heliUp = heliActive(PUR.wave);
+  const n = waveCars(PUR.wave);
+  for (let i = 0; i < PUR.cars.length; i++) {
+    const c = PUR.cars[i];
+    c.live = i < n;
+    if (!c.live) continue;
+    c.z = G.dist - (110 + i * 34);
+    c.lat = Math.max(-CFG.LAT_LIMIT, Math.min(CFG.LAT_LIMIT,
+      G.lat + (i % 2 ? 3.4 : -3.4)));
+    c.spd = G.spd; c.latV = 0; c.cool = 0;
+    c.side = i % 2 ? 1 : -1;
+    c.lungeT = 2.6 + i * 1.3;
+  }
+  PUR.spotZ = G.dist - 70; PUR.spotLat = G.lat;
+  toast(PUR.heliUp ? 'AIR SUPPORT' : 'WANTED', '#ff2540');
+  buzz([30, 50, 30]);
+}
+
+function endPursuit(reason) {
+  PUR.state = 'clear';
+  PUR.heat = POLICE.HEAT_AFTER;
+  PUR.cars.forEach(c => { c.live = false; });
+  cruisers.forEach(g => { g.visible = false; });
+  heli.visible = false; spot.visible = false;
+  PUR.heliUp = false; PUR.spotted = false; PUR.escT = 0;
+  G.score += 260 * PUR.wave * comboMult(G.combo);
+  toast(reason === 'gap' ? 'LOST THEM' : 'CALLED OFF', '#4dffa8');
+  buzz(45);
+}
+
+function updatePolice(dt) {
+  const running = G.phase === 'run' && !paused;
+
+  if (PUR.state === 'clear') {
+    if (running) {
+      PUR.heat += heatRate(G.wrong, G.boostT > 0, G.dist / 1000) * dt;
+      PUR.heat = Math.max(0, Math.min(POLICE.HEAT_MAX, PUR.heat));
+      if (PUR.heat >= POLICE.HEAT_MAX) startPursuit();
+    }
+  } else if (running) {
+    PUR.t += dt;
+    if (PUR.lungeLock > 0) PUR.lungeLock -= dt;
+
+    /* The spotlight tracks with a deliberate lag, so a hard lateral move
+       throws it off your roof. That is the whole counterplay against air
+       support and it falls out of the lag rather than a special case. */
+    if (PUR.heliUp) {
+      /* The helicopter matches your speed trivially, so the light holds
+         station on your tail longitudinally. Lagging spotZ against a
+         distance that only ever grows gives a first-order filter a
+         permanent steady-state offset of speed x tau — about 80 m at
+         racing speed — so the light could never lock on at all. The lag
+         that carries the counterplay is the LATERAL one. */
+      PUR.spotZ = G.dist - 6;
+      PUR.spotLat += (G.lat - PUR.spotLat) * Math.min(1, dt * POLICE.SPOT_LAG);
+      PUR.spotted = Math.abs(PUR.spotLat - G.lat) < POLICE.SPOT_LAT;
+    } else {
+      PUR.spotted = false;
+    }
+
+    let nearest = 1e9;
+    for (let i = 0; i < PUR.cars.length; i++) {
+      const c = PUR.cars[i];
+      if (!c.live) continue;
+      const gap = G.dist - c.z;
+      if (c.cool > 0) c.cool -= dt;
+
+      c.spd = cruiserSpeed(G.spd, PUR.wave, gap, PUR.spotted);
+
+      /* traffic is the great equaliser: cruisers have to get through the
+         same cars you do, and when they clip one they lose real speed */
+      let avoid = 0;
+      for (let k = 0; k < active.length; k++) {
+        const tc = active[k];
+        const dz = tc._z - c.z;
+        if (dz > 30 || dz < -10) continue;
+        const dl = tc._lat - c.lat;
+        if (Math.abs(dl) > 2.8) continue;
+        if (Math.abs(dz) < 5.2) {
+          c.spd *= 0.58;
+          c.latV += (dl >= 0 ? -1 : 1) * 6;
+          burstSparks(rX(c.z, c.lat), 0.8, rZ(c.z), 5, 7, [1, 0.7, 0.3]);
+        } else {
+          avoid += (dl >= 0 ? -1 : 1) * 2.4;
+        }
+      }
+
+      c.z += c.spd * dt;
+
+      /* Cruisers shadow you from one side and lunge periodically, rather
+         than homing onto your exact lane and grinding. Perfect tracking
+         makes contact a certainty instead of a threat, and a pursuit you
+         cannot dodge is just a countdown with sirens. */
+      c.lungeT -= dt;
+      if (c.lungeT < 0 && !c.lunging) {
+        /* Extra cruisers should mean more of the road covered, not more
+           lunges per second. Without this lock, wave five is simply an
+           unbroken stream of contact and no amount of skill reads it. */
+        if (PUR.lungeLock > 0) c.lungeT = 0.35;
+        else { c.lunging = true; PUR.lungeLock = POLICE.LUNGE_TIME + POLICE.LUNGE_LOCK; }
+      }
+      if (c.lunging && c.lungeT < -POLICE.LUNGE_TIME) {
+        c.lunging = false;
+        c.lungeT = POLICE.LUNGE_GAP + Math.random() * 2.2;
+      }
+      const lunging = c.lunging;
+
+      let tgt = G.lat + (lunging ? 0 : c.side * 2.95) + avoid;
+      const sameSide = (G.lat >= 0) === (c.lat >= 0);
+      if (!sameSide && medianBlocked(G.seed, c.z)) {
+        tgt = (c.lat >= 0 ? 1 : -1) * laneOffset(0);
+      }
+      c.latV += ((tgt - c.lat) * 1.65 - c.latV) * Math.min(1, dt * 4);
+      c.lat += c.latV * dt;
+      c.lat = Math.max(-CFG.LAT_LIMIT, Math.min(CFG.LAT_LIMIT, c.lat));
+      if (Math.abs(c.lat) < MED.HW + CFG.CAR_HW && medianBlocked(G.seed, c.z)) {
+        c.lat = (c.lat >= 0 ? 1 : -1) * (MED.HW + CFG.CAR_HW);
+        c.latV = 0;
+      }
+
+      if (c.cool <= 0 && G.iframeT <= 0 &&
+          Math.abs(gap) < CFG.CAR_HL * 1.9 &&
+          Math.abs(c.lat - G.lat) < CFG.CAR_HW * 2) {
+        c.cool = POLICE.RAM_COOL;
+        c.z -= 26; c.spd *= 0.55;
+        crash(G.dist, c.lat, c.lat - G.lat, 'RAMMED');
+        drawPolice(dt);
+        return;
+      }
+      nearest = Math.min(nearest, Math.abs(gap));
+    }
+
+    if (!PUR.spotted && nearest > POLICE.ESCAPE_GAP) PUR.escT += dt;
+    else PUR.escT = 0;
+
+    if (PUR.escT >= POLICE.ESCAPE_HOLD) endPursuit('gap');
+    else if (PUR.t >= POLICE.PURSUIT_MAX) endPursuit('timer');
+  }
+
+  drawPolice(dt);
+}
+
+function drawPolice(dt) {
+  const flash = Math.sin(nowT * 13) > 0;
+  for (let i = 0; i < PUR.cars.length; i++) {
+    const c = PUR.cars[i], g = cruisers[i];
+    if (!c.live) { g.visible = false; continue; }
+    const dz = c.z - G.dist;
+    if (dz < -760 || dz > 300) { g.visible = false; continue; }
+    g.visible = true;
+    g.position.set(rX(c.z, c.lat), rY(c.z, 0), rZ(c.z));
+    g.rotation.y = -ROAD.heading(c.z) + Math.atan2(c.latV, Math.max(6, c.spd));
+    /* the beacons face rearward in local space, which is straight at the
+       player, so they need no billboarding */
+    g.userData.beacons[0].material.uniforms.uOpacity.value = flash ? 1 : 0.05;
+    g.userData.beacons[1].material.uniforms.uOpacity.value = flash ? 0.05 : 1;
+    const wc = flash ? 0xff2540 : 0x2f6bff;
+    g.userData.wash.material.uniforms.uColor.value.setHex(wc);
+    g.userData.wash.material.uniforms.uEmis.value.setHex(wc);
+    /* a lunge has to be telegraphed or it is not dodgeable */
+    const lu = c.lunging ? 1.7 : 1.0;
+    g.userData.wash.scale.set(lu, lu, 1);
+    g.userData.wash.material.uniforms.uOpacity.value = c.lunging ? 0.95 : 0.55;
+  }
+
+  if (PUR.state === 'chase' && PUR.heliUp) {
+    const px = rX(PUR.spotZ, PUR.spotLat), py = rY(PUR.spotZ, 0), pz = rZ(PUR.spotZ);
+    heli.visible = true;
+    heli.position.set(px, py + 44, pz);
+    heli.rotation.y = -ROAD.heading(PUR.spotZ) + Math.PI;
+    heli.userData.rotor.rotation.y = nowT * 30;
+    const nf = Math.sin(nowT * 6) > 0;
+    heli.userData.navs[0].material.uniforms.uOpacity.value = nf ? 1 : 0.12;
+    heli.userData.navs[1].material.uniforms.uOpacity.value = nf ? 0.12 : 1;
+
+    spot.visible = true;
+    spot.position.set(px, py, pz);
+    spot.userData.pool.material.uniforms.uOpacity.value = PUR.spotted ? 0.82 : 0.42;
+    const beam = spot.userData.beam;
+    beam.position.set(0, 22, 0);
+    beam.scale.set(1, 44, 1);
+    beam.rotation.y = Math.atan2(camera.position.x - px, camera.position.z - pz);
+    beam.material.uniforms.uOpacity.value = PUR.spotted ? 0.2 : 0.11;
+  } else {
+    heli.visible = false;
+    spot.visible = false;
+  }
 }
 
 /* ==================================================================== */
@@ -2854,7 +3303,8 @@ const UI = {
   combo: el('combo'), comboN: el('comboN'), comboFill: el('comboFill'),
   agi: el('agi'), charge: el('charge'), boost: el('boostBtn'),
   toast: el('toast'), rivals: el('rivals'), cd: el('cd'), flash: el('flash'),
-  wrong: el('wrong')
+  wrong: el('wrong'), heat: el('heat'), heatFill: el('heatFill'),
+  wanted: el('wanted'), wantedTxt: el('wantedTxt'), escFill: el('escFill')
 };
 const CHARGE_GLYPH = ['切', '走', '疾'];
 
@@ -2896,6 +3346,17 @@ function updateHud(dt) {
   hudT -= dt;
   UI.combo.classList.toggle('on', G.combo > 0);
   UI.wrong.style.opacity = (G.wrong && G.phase === 'run') ? 1 : 0;
+  const hunted = PUR.state === 'chase';
+  UI.heat.style.opacity = (G.phase === 'run' && (PUR.heat > 1 || hunted)) ? 1 : 0;
+  UI.heat.classList.toggle('hot', hunted);
+  UI.heatFill.style.width = (hunted ? 100 : PUR.heat) + '%';
+  UI.wanted.style.display = hunted ? 'flex' : 'none';
+  if (hunted) {
+    UI.wantedTxt.textContent = 'WANTED ' + '\u2605'.repeat(PUR.wave);
+    const esc = Math.max(PUR.escT / POLICE.ESCAPE_HOLD, PUR.t / POLICE.PURSUIT_MAX);
+    UI.escFill.style.width = Math.min(100, esc * 100) + '%';
+    UI.escFill.style.background = PUR.spotted ? 'var(--mag)' : 'var(--ok)';
+  }
   UI.comboFill.style.width = Math.max(0, (G.comboT / CFG.COMBO_TIME) * 100) + '%';
   if (hudT > 0) return;
   hudT = 0.07;
@@ -2920,6 +3381,7 @@ function updateRivalTape() {
     const col = '#' + (p.color || 0x22e7ff).toString(16).padStart(6, '0');
     return '<div class="rv" style="border-color:' + col + '">' +
       '<b>' + esc((p.name || '???').slice(0, 8)) + '</b>' +
+      (p.wt ? '<em style="color:#ff2540">\u2605' + p.wt + '</em>' : '') +
       '<em>' + (p.alive ? (gap >= 0 ? '+' : '') + gap + 'm' : 'OUT') + '</em></div>';
   }).join('');
 }
@@ -2966,6 +3428,7 @@ function resetRun() {
   batchCache.clear();
   gapsUsed.clear();
   G.medSide = 1;
+  resetPolice();
   paused = false;
   el('pause').textContent = 'PAUSE';
   renderCharges();
@@ -3232,6 +3695,7 @@ function init() {
   buildSparks();
   buildRings();
   buildGhosts();
+  buildPolice();
 
   playerCar = buildPlayerCar(0x141a30, 0x22e7ff);
   scene.add(playerCar);
@@ -3288,6 +3752,7 @@ function loop() {
   updateCity(G.seed);
   updateTraffic(dt);
   if (running) collide(dt);
+  updatePolice(dt);
   updateRain(dt, G.spd, G.lat);
   updateSparks(dt);
   updateRings(dt);
@@ -3320,7 +3785,8 @@ function loop() {
       gaugeT = 0.1;
       const rpm = 0.22 + 0.66 * Math.max(0, Math.min(1,
         (G.spd - CFG.SPD_START) / (CFG.SPD_MAX - CFG.SPD_START))) + (G.boostT > 0 ? 0.2 : 0);
-      drawGauge(cockpit.userData.gauge, G.spd * 3.6, rpm, G.hp, G.charges);
+      drawGauge(cockpit.userData.gauge, G.spd * 3.6, rpm, G.hp, G.charges,
+        PUR.state === 'chase' ? PUR.wave : 0);
     }
   }
 
