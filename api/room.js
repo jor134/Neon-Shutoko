@@ -75,6 +75,7 @@ function sanitize(body, now) {
     hp: num(body.hp, 0, 9, 3) | 0,
     sc: num(body.sc, 0, 1e9, 0) | 0,
     cb: num(body.cb, 0, 999, 0) | 0,
+    wt: num(body.wt, 0, 9, 0) | 0,
     alive: body.alive ? 1 : 0,
     done: body.done ? 1 : 0,
     t: now
